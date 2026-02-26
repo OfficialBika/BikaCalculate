@@ -1,5 +1,8 @@
-// BIKA Calculator Bot — FULL index.js
-// Render Webhook + MongoDB + Admin Dashboard + Broadcast
+// BIKA Calculator Bot — FULL index.js (UPDATED)
+// - /start: Bot အသုံးပြုပုံမြန်မာ+Eng 설명
+// - /calculator: UI Calculator Keyboard
+// - /calc: Quick expression calc
+// - MongoDB + Admin + Broadcast + Inline + Group Auto Calc
 // -------------------------------------------------------
 
 require("dotenv").config();
@@ -51,7 +54,7 @@ const Group = mongoose.model("Group", groupSchema);
 
 // -------------------- Runtime State --------------------
 const startTime = Date.now();
-const adminCache = new Map(); // chatId -> boolean (bot is admin or not)
+const adminCache = new Map(); // chatId -> boolean
 const state = new Map(); // chatId -> { expr, result, msgId }
 
 // -------------------- Helper: Safe Eval --------------------
@@ -198,10 +201,18 @@ async function trackContext(ctx) {
   }
 }
 
+// Non-blocking helper (speed up response)
+function trackContextAsync(ctx) {
+  trackContext(ctx).catch((err) => {
+    console.error("trackContext async error:", err.message);
+  });
+}
+
 // -------------------- Helper: Bot admin in group? --------------------
 async function isBotAdminInChat(ctx) {
   const chat = ctx.chat;
-  if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return false;
+  if (!chat || (chat.type !== "group" && chat.type !== "supergroup"))
+    return false;
 
   const chatId = chat.id;
   if (adminCache.has(chatId)) {
@@ -210,8 +221,7 @@ async function isBotAdminInChat(ctx) {
 
   try {
     const me = await ctx.telegram.getChatMember(chatId, ctx.botInfo.id);
-    const isAdmin =
-      me.status === "administrator" || me.status === "creator";
+    const isAdmin = me.status === "administrator" || me.status === "creator";
     adminCache.set(chatId, isAdmin);
     return isAdmin;
   } catch (err) {
@@ -256,8 +266,30 @@ bot.on("my_chat_member", async (ctx) => {
 });
 
 // -------------------- Commands --------------------
+
+// /start => Bot အလုပ်လုပ်ပုံရှင်းပြ (UI မထည့်တော့)
 bot.start(async (ctx) => {
-  await trackContext(ctx);
+  trackContextAsync(ctx);
+
+  const text =
+    "🧮 *BIKA Calculator Bot* မှ ကြိုဆိုပါတယ်!\n\n" +
+    "ဒီ Bot လေးနဲ့ အောက်မှာလို လုပ်ဆောင်နိုင်ပါတယ် 👇\n\n" +
+    "• bot ဆီကို မိမိတွက်ချက်ချင်တာ တိုက်ရိုက်ပို့လို့ရ\n" +
+    "• `/calculator` – Calculator UI ဖွင့်ပြီး button နဲ့တွက်ချင်ရင်\n" +
+    "• `/calc 12*(3+4)` – Command နဲ့ တစ်ကြိမ်တည်း တွက်ချင်ရင်\n" +
+    "• Group ထဲမှာ `4*5` လို ရေးပို့ရင် (bot ကို adminပေးထားရမယ်) => `4×5 = 20` လို့ auto ပြန်ပေးမယ်\n" +
+    "• Inline mode: `မိမိပို့လိုတဲ့ Chat မှာ @Bika_CalcuBot 12+3` လို ရိုက်ပြီး chat ထဲသို့ ရလဒ် ပို့လို့ရမယ်\n\n" +
+    "Admin (Owner Only) 🛡\n" +
+    "• `/admin` – Bot Users, Groups, Uptime စတာတွေ ကြည့်ရန်\n" +
+    "• `/broadcast Your message` – Bot အသုံးပြုနေသူတွေကို အကြောင်းကြားဖို့\n\n" +
+    "_Tip: /calculator ကို သုံးပြီး button UI နဲ့ တွက်ကြည့်ပါ_ 😉";
+
+  return ctx.reply(text, { parse_mode: "Markdown" });
+});
+
+// /calculator => UI Calculator ဖွင့်မယ်
+bot.command("calculator", async (ctx) => {
+  trackContextAsync(ctx);
 
   const chatId = ctx.chat.id;
   const s = { expr: "", result: "", msgId: null };
@@ -267,8 +299,9 @@ bot.start(async (ctx) => {
   s.msgId = msg.message_id;
 });
 
+// /calc => quick calculate
 bot.command("calc", async (ctx) => {
-  await trackContext(ctx);
+  trackContextAsync(ctx);
   const input = ctx.message.text.replace("/calc", "").trim();
   if (!input) return ctx.reply("Usage: /calc 12*(3+4)");
 
@@ -282,7 +315,7 @@ bot.command("calc", async (ctx) => {
 
 // Owner-only admin dashboard
 bot.command("admin", async (ctx) => {
-  await trackContext(ctx);
+  trackContextAsync(ctx);
   if (!OWNER_ID || ctx.from.id !== OWNER_ID) {
     return ctx.reply("❌ Owner only command.");
   }
@@ -321,7 +354,7 @@ bot.command("admin", async (ctx) => {
 
 // Owner-only broadcast
 bot.command("broadcast", async (ctx) => {
-  await trackContext(ctx);
+  trackContextAsync(ctx);
   if (!OWNER_ID || ctx.from.id !== OWNER_ID) {
     return ctx.reply("❌ Owner only command.");
   }
@@ -370,7 +403,7 @@ bot.command("broadcast", async (ctx) => {
 
 // -------------------- Text (Group auto-calc + Private calc) --------------------
 bot.on("text", async (ctx) => {
-  await trackContext(ctx);
+  trackContextAsync(ctx);
 
   const text = ctx.message.text.trim();
   if (text.startsWith("/")) return; // commands handled separately
@@ -385,7 +418,6 @@ bot.on("text", async (ctx) => {
       const prettyExpr = text.replace(/\*/g, "×").replace(/\//g, "÷");
       return ctx.reply(`${prettyExpr} = ${result}`);
     } catch (_) {
-      // not a valid expression -> ignore in group
       return;
     }
   }
@@ -401,7 +433,7 @@ bot.on("text", async (ctx) => {
   }
 });
 
-// -------------------- Button UI actions (NO DB here = faster) --------------------
+// -------------------- Button UI actions --------------------
 bot.on("callback_query", async (ctx) => {
   const chatId = ctx.chat.id;
   const data = ctx.callbackQuery.data || "";
@@ -451,7 +483,6 @@ bot.on("callback_query", async (ctx) => {
 bot.on("inline_query", async (ctx) => {
   const q = (ctx.inlineQuery.query || "").trim();
 
-  // Query မရိုက်သေးရင် Hint ပြမယ်
   if (!q) {
     return ctx.answerInlineQuery(
       [
@@ -462,7 +493,7 @@ bot.on("inline_query", async (ctx) => {
           description: "Example: 12*(3+4) or 5+6",
           input_message_content: {
             message_text:
-              "🧮 BIKA Calculator Inline Mode\n\nType something like `12*(3+4)` after @Bika_CalcuBot to calculate.",
+              "🧮 BIKA Calculator Inline Mode\n\nType something like `12*(3+4)` after @YourBot to calculate.",
             parse_mode: "Markdown",
           },
         },
@@ -477,11 +508,8 @@ bot.on("inline_query", async (ctx) => {
 
   try {
     const r = safeEval(q);
-    // Title & description
     title = `🧮 ${q} = ${r}`;
     description = "Tap to send this result";
-
-    // Chat ထဲထွက်မယ့် message
     messageText = `🧮 BIKA Calculator\n\n${q} = ${r}`;
   } catch (e) {
     title = `❌ Invalid expression`;
@@ -504,6 +532,7 @@ bot.on("inline_query", async (ctx) => {
     { cache_time: 1 }
   );
 });
+
 // -------------------- ✅ Webhook Server (Render) --------------------
 const app = express();
 
@@ -511,19 +540,15 @@ app.get("/", (req, res) => res.status(200).send("OK - BIKA Calculator Bot"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 app.use(express.json());
-
-// Telegraf webhook middleware (root mount, path = /telegraf)
 app.use(bot.webhookCallback("/telegraf"));
 
 async function start() {
   try {
-    // MongoDB connect
     await mongoose.connect(MONGODB_URI, {
       maxPoolSize: 10,
     });
     console.log("✅ MongoDB connected");
 
-    // bot info (for admin check)
     const me = await bot.telegram.getMe();
     bot.botInfo = me;
     console.log(`🤖 Logged in as @${me.username}`);
