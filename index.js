@@ -1,3 +1,7 @@
+// BIKA Calculator Bot — FULL index.js
+// Render Webhook + MongoDB + Admin Dashboard + Broadcast
+// -------------------------------------------------------
+
 require("dotenv").config();
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
@@ -7,7 +11,7 @@ const mongoose = require("mongoose");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN in .env");
 
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://xxx.onrender.com
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://bikacalculate.onrender.com
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const OWNER_ID = Number(process.env.OWNER_ID || 0);
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -47,8 +51,8 @@ const Group = mongoose.model("Group", groupSchema);
 
 // -------------------- Runtime State --------------------
 const startTime = Date.now();
-const adminCache = new Map();        // chatId -> boolean (bot is admin or not)
-const state = new Map();             // chatId -> { expr, result, msgId }
+const adminCache = new Map(); // chatId -> boolean (bot is admin or not)
+const state = new Map(); // chatId -> { expr, result, msgId }
 
 // -------------------- Helper: Safe Eval --------------------
 function safeEval(expr) {
@@ -329,7 +333,6 @@ bot.command("broadcast", async (ctx) => {
 
   const msg = `📢 [BIKA Calculator Broadcast]\n\n${args}`;
 
-  // Get all users and active groups from DB
   const [userDocs, groupDocs] = await Promise.all([
     User.find({ isBlocked: { $ne: true } }).select("userId").lean().exec(),
     Group.find({ isActive: true }).select("chatId").lean().exec(),
@@ -398,10 +401,8 @@ bot.on("text", async (ctx) => {
   }
 });
 
-// -------------------- Button UI actions --------------------
+// -------------------- Button UI actions (NO DB here = faster) --------------------
 bot.on("callback_query", async (ctx) => {
-  await trackContext(ctx);
-
   const chatId = ctx.chat.id;
   const data = ctx.callbackQuery.data || "";
   const s = state.get(chatId) || { expr: "", result: "", msgId: null };
@@ -446,31 +447,46 @@ bot.on("callback_query", async (ctx) => {
   return ctx.answerCbQuery();
 });
 
-// -------------------- ✅ Inline Mode --------------------
+// -------------------- ✅ Inline Mode (UPGRADED) --------------------
 bot.on("inline_query", async (ctx) => {
   const q = (ctx.inlineQuery.query || "").trim();
 
+  // Query မရိုက်သေးရင် Hint ပြမယ်
   if (!q) {
     return ctx.answerInlineQuery(
       [
         {
           type: "article",
           id: "hint",
-          title: "Type an expression like: 1+2 or 12*(3+4)",
-          input_message_content: { message_text: "🧮 Try: 12*(3+4)" },
-          description: "Calculator inline mode",
+          title: "BIKA Calculator Inline",
+          description: "Example: 12*(3+4) or 5+6",
+          input_message_content: {
+            message_text:
+              "🧮 BIKA Calculator Inline Mode\n\nType something like `12*(3+4)` after @Bika_CalcuBot to calculate.",
+            parse_mode: "Markdown",
+          },
         },
       ],
       { cache_time: 1 }
     );
   }
 
-  let resultText;
+  let title;
+  let description;
+  let messageText;
+
   try {
     const r = safeEval(q);
-    resultText = `🧮 ${q}\n= ${r}`;
+    // Title & description
+    title = `🧮 ${q} = ${r}`;
+    description = "Tap to send this result";
+
+    // Chat ထဲထွက်မယ့် message
+    messageText = `🧮 BIKA Calculator\n\n${q} = ${r}`;
   } catch (e) {
-    resultText = `❌ ${q}\n${e.message}`;
+    title = `❌ Invalid expression`;
+    description = e.message || "Error while calculating";
+    messageText = `❌ BIKA Calculator\n\nExpression: ${q}\nError: ${description}`;
   }
 
   return ctx.answerInlineQuery(
@@ -478,17 +494,16 @@ bot.on("inline_query", async (ctx) => {
       {
         type: "article",
         id: "calc_" + Date.now(),
-        title: resultText.split("\n")[0],
-        description: resultText.includes("\n=")
-          ? resultText.split("\n")[1]
-          : resultText,
-        input_message_content: { message_text: resultText },
+        title,
+        description,
+        input_message_content: {
+          message_text: messageText,
+        },
       },
     ],
     { cache_time: 1 }
   );
 });
-
 // -------------------- ✅ Webhook Server (Render) --------------------
 const app = express();
 
@@ -496,7 +511,8 @@ app.get("/", (req, res) => res.status(200).send("OK - BIKA Calculator Bot"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 app.use(express.json());
-// ✅ Telegraf Official style
+
+// Telegraf webhook middleware (root mount, path = /telegraf)
 app.use(bot.webhookCallback("/telegraf"));
 
 async function start() {
