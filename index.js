@@ -496,7 +496,8 @@ app.get("/", (req, res) => res.status(200).send("OK - BIKA Calculator Bot"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 app.use(express.json());
-app.use("/telegraf", bot.webhookCallback("/telegraf"));
+// ✅ Telegraf Official style
+app.use(bot.webhookCallback("/telegraf"));
 
 async function start() {
   try {
