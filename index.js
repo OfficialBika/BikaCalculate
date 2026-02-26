@@ -6,13 +6,21 @@ const { create, all } = require("mathjs");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN in .env");
 
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://xxx.up.railway.app
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://xxx.onrender.com
 const PORT = parseInt(process.env.PORT || "8080", 10);
+const OWNER_ID = Number(process.env.OWNER_ID || 0);
 
 const math = create(all, { number: "number" });
 const bot = new Telegraf(BOT_TOKEN);
 
-// -------------------- Safe Eval --------------------
+// Stats + state
+const startTime = Date.now();
+const users = new Set();             // user ids
+const groups = new Map();            // chatId -> { title, type }
+const adminCache = new Map();        // chatId -> boolean (bot is admin or not)
+const state = new Map();             // chatId -> { expr, result, msgId }
+
+// -------------------- Helper: Safe Eval --------------------
 function safeEval(expr) {
   let s = String(expr || "").trim();
   s = s
@@ -22,7 +30,6 @@ function safeEval(expr) {
     .replace(/−/g, "-")
     .replace(/,/g, "");
 
-  // basic guard
   const blocked = /(import|createUnit|evaluate|parse|simplify|derivative|compile|help|unit|format|typed|reviver|json|chain|matrix|ones|zeros|range|index|subset|concat|resize)/i;
   if (blocked.test(s)) throw new Error("Unsupported expression.");
 
@@ -39,7 +46,7 @@ function safeEval(expr) {
   return String(result);
 }
 
-// -------------------- Calculator UI (optional) --------------------
+// -------------------- Helper: Keyboard + UI --------------------
 function kb() {
   return Markup.inlineKeyboard([
     [
@@ -81,18 +88,75 @@ function renderUI(expr, result) {
   return `🧮 BIKA Calculator\n\nExpr: ${e}\nResult: ${r}\n\nTip: Inline → @YourBot 12*(3+4)`;
 }
 
-const state = new Map(); // chatId => { expr, result, msgId }
+// -------------------- Helper: Track users/groups --------------------
+function trackContext(ctx) {
+  try {
+    if (ctx.from && ctx.from.id) {
+      users.add(ctx.from.id);
+    }
+    if (ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup")) {
+      groups.set(ctx.chat.id, {
+        title: ctx.chat.title || "",
+        type: ctx.chat.type,
+      });
+    }
+  } catch (_) {
+    // ignore tracking errors
+  }
+}
+
+// -------------------- Helper: Bot admin in group? --------------------
+async function isBotAdminInChat(ctx) {
+  const chat = ctx.chat;
+  if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return false;
+
+  const chatId = chat.id;
+  if (adminCache.has(chatId)) {
+    return adminCache.get(chatId);
+  }
+
+  try {
+    const me = await ctx.telegram.getChatMember(chatId, ctx.botInfo.id);
+    const isAdmin =
+      me.status === "administrator" || me.status === "creator";
+    adminCache.set(chatId, isAdmin);
+    return isAdmin;
+  } catch (err) {
+    console.error("getChatMember failed:", err.message);
+    adminCache.set(chatId, false);
+    return false;
+  }
+}
+
+// -------------------- Helper: Uptime format --------------------
+function formatUptime(ms) {
+  let sec = Math.floor(ms / 1000);
+  const days = Math.floor(sec / 86400); sec %= 86400;
+  const hours = Math.floor(sec / 3600); sec %= 3600;
+  const mins = Math.floor(sec / 60); sec %= 60;
+
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (mins) parts.push(`${mins}m`);
+  parts.push(`${sec}s`);
+  return parts.join(" ");
+}
 
 // -------------------- Commands --------------------
 bot.start(async (ctx) => {
+  trackContext(ctx);
+
   const chatId = ctx.chat.id;
   const s = { expr: "", result: "", msgId: null };
   state.set(chatId, s);
+
   const msg = await ctx.reply(renderUI("", ""), kb());
   s.msgId = msg.message_id;
 });
 
 bot.command("calc", async (ctx) => {
+  trackContext(ctx);
   const input = ctx.message.text.replace("/calc", "").trim();
   if (!input) return ctx.reply("Usage: /calc 12*(3+4)");
 
@@ -104,21 +168,120 @@ bot.command("calc", async (ctx) => {
   }
 });
 
-// Plain text calculator
-bot.on("text", async (ctx) => {
-  const text = ctx.message.text.trim();
-  if (text.startsWith("/")) return;
+// Owner-only admin dashboard
+bot.command("admin", async (ctx) => {
+  trackContext(ctx);
+  if (!OWNER_ID || ctx.from.id !== OWNER_ID) {
+    return ctx.reply("❌ Owner only command.");
+  }
 
-  try {
-    const result = safeEval(text);
-    return ctx.reply(`🧮 ${text}\n= ${result}`);
-  } catch (e) {
-    return ctx.reply(`❌ ${e.message}`);
+  const totalUsers = users.size;
+  const totalGroups = groups.size;
+  const uptimeMs = Date.now() - startTime;
+  const uptimeStr = formatUptime(uptimeMs);
+
+  let groupList = "";
+  let index = 1;
+  for (const [chatId, info] of groups.entries()) {
+    if (index > 30) {
+      groupList += `\n… and more (${totalGroups} groups total)`;
+      break;
+    }
+    groupList += `\n${index}. ${info.title || "(no title)"} [${chatId}]`;
+    index++;
+  }
+
+  const text =
+    `🔐 BIKA Calculator — Admin Dashboard\n\n` +
+    `👤 Bot Users: ${totalUsers}\n` +
+    `👥 Total Groups: ${totalGroups}\n` +
+    `⏱ Uptime: ${uptimeStr}\n` +
+    `${totalGroups ? "\n📜 Group List:" + groupList : ""}`;
+
+  return ctx.reply(text);
+});
+
+// Owner-only broadcast
+bot.command("broadcast", async (ctx) => {
+  trackContext(ctx);
+  if (!OWNER_ID || ctx.from.id !== OWNER_ID) {
+    return ctx.reply("❌ Owner only command.");
+  }
+
+  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!args) {
+    return ctx.reply("Usage: /broadcast Your message here");
+  }
+
+  const msg = `📢 [BIKA Calculator Broadcast]\n\n${args}`;
+  let userOk = 0, userFail = 0;
+  let groupOk = 0, groupFail = 0;
+
+  // send to users
+  for (const userId of users) {
+    try {
+      await ctx.telegram.sendMessage(userId, msg);
+      userOk++;
+    } catch (_) {
+      userFail++;
+    }
+  }
+
+  // send to groups
+  for (const [chatId] of groups.entries()) {
+    try {
+      await ctx.telegram.sendMessage(chatId, msg);
+      groupOk++;
+    } catch (_) {
+      groupFail++;
+    }
+  }
+
+  return ctx.reply(
+    `✅ Broadcast finished.\n\n` +
+    `👤 Users: ${userOk} sent, ${userFail} failed.\n` +
+    `👥 Groups: ${groupOk} sent, ${groupFail} failed.`
+  );
+});
+
+// -------------------- Plain text calculator --------------------
+bot.on("text", async (ctx) => {
+  trackContext(ctx);
+
+  const text = ctx.message.text.trim();
+  if (text.startsWith("/")) return; // commands handled separately
+
+  // GROUP MODE: auto calc only when bot is admin
+  if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+    const isAdmin = await isBotAdminInChat(ctx);
+    if (!isAdmin) return;
+
+    try {
+      const result = safeEval(text);
+      // pretty: replace * with ×, / with ÷ in expression only
+      const prettyExpr = text.replace(/\*/g, "×").replace(/\//g, "÷");
+      return ctx.reply(`${prettyExpr} = ${result}`);
+    } catch (_) {
+      // not a valid expression -> ignore in group
+      return;
+    }
+  }
+
+  // PRIVATE CHAT: normal calculator with error messages
+  if (ctx.chat.type === "private") {
+    try {
+      const result = safeEval(text);
+      return ctx.reply(`🧮 ${text}\n= ${result}`);
+    } catch (e) {
+      return ctx.reply(`❌ ${e.message}`);
+    }
   }
 });
 
-// Button UI actions
+// -------------------- Button UI actions --------------------
 bot.on("callback_query", async (ctx) => {
+  trackContext(ctx);
+
   const chatId = ctx.chat.id;
   const data = ctx.callbackQuery.data || "";
   const s = state.get(chatId) || { expr: "", result: "", msgId: null };
@@ -144,7 +307,13 @@ bot.on("callback_query", async (ctx) => {
 
   try {
     if (s.msgId) {
-      await ctx.telegram.editMessageText(chatId, s.msgId, undefined, renderUI(s.expr, s.result), kb());
+      await ctx.telegram.editMessageText(
+        chatId,
+        s.msgId,
+        undefined,
+        renderUI(s.expr, s.result),
+        kb()
+      );
     } else {
       const msg = await ctx.reply(renderUI(s.expr, s.result), kb());
       s.msgId = msg.message_id;
@@ -186,14 +355,15 @@ bot.on("inline_query", async (ctx) => {
     resultText = `❌ ${q}\n${e.message}`;
   }
 
-  // Show as selectable inline result
   return ctx.answerInlineQuery(
     [
       {
         type: "article",
         id: "calc_" + Date.now(),
-        title: resultText.split("\n")[0], // first line as title
-        description: resultText.includes("\n=") ? resultText.split("\n")[1] : resultText,
+        title: resultText.split("\n")[0],
+        description: resultText.includes("\n=")
+          ? resultText.split("\n")[1]
+          : resultText,
         input_message_content: { message_text: resultText },
       },
     ],
@@ -201,7 +371,7 @@ bot.on("inline_query", async (ctx) => {
   );
 });
 
-// -------------------- ✅ Webhook Server (Railway/Render) --------------------
+// -------------------- ✅ Webhook Server (Render) --------------------
 const app = express();
 
 // health check + uptime ping target
@@ -210,24 +380,28 @@ app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 app.use(express.json());
 
-// Webhook endpoint
-app.use(await bot.createWebhook({ domain: WEBHOOK_URL, path: "/telegraf" }));
-app.post("/telegraf", (req, res) => {
-  // handled by telegraf webhook middleware
-  res.sendStatus(200);
-});
+// Telegraf webhook middleware
+app.use("/telegraf", bot.webhookCallback("/telegraf"));
 
 async function start() {
-  if (!WEBHOOK_URL) {
-    // fallback: long polling (local dev)
-    await bot.launch();
-    console.log("✅ Started with long polling (no WEBHOOK_URL)");
-    return;
-  }
+  try {
+    // Make sure botInfo is available (for getChatMember)
+    const me = await bot.telegram.getMe();
+    bot.botInfo = me;
+    console.log(`🤖 Logged in as @${me.username}`);
 
-  // setWebhook to your domain
-  await bot.telegram.setWebhook(`${WEBHOOK_URL}/telegraf`);
-  app.listen(PORT, () => console.log(`✅ Webhook server running on ${PORT}`));
+    if (!WEBHOOK_URL) {
+      await bot.launch();
+      console.log("✅ Started with long polling (no WEBHOOK_URL)");
+    } else {
+      await bot.telegram.setWebhook(`${WEBHOOK_URL}/telegraf`);
+      app.listen(PORT, () =>
+        console.log(`✅ Webhook server running on ${PORT}`)
+      );
+    }
+  } catch (err) {
+    console.error("❌ Failed to start bot:", err);
+  }
 }
 
 start();
