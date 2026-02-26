@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 const { create, all } = require("mathjs");
+const mongoose = require("mongoose");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN in .env");
@@ -9,14 +10,43 @@ if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN in .env");
 const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://xxx.onrender.com
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const OWNER_ID = Number(process.env.OWNER_ID || 0);
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) throw new Error("Missing MONGODB_URI in .env");
 
 const math = create(all, { number: "number" });
 const bot = new Telegraf(BOT_TOKEN);
 
-// Stats + state
+// -------------------- MongoDB Models --------------------
+const userSchema = new mongoose.Schema(
+  {
+    userId: { type: Number, unique: true, index: true },
+    firstName: String,
+    lastName: String,
+    username: String,
+    languageCode: String,
+    isBot: Boolean,
+    isBlocked: { type: Boolean, default: false },
+    lastSeenAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+const groupSchema = new mongoose.Schema(
+  {
+    chatId: { type: Number, unique: true, index: true },
+    title: String,
+    type: String, // group / supergroup
+    isActive: { type: Boolean, default: true },
+    lastSeenAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+const User = mongoose.model("User", userSchema);
+const Group = mongoose.model("Group", groupSchema);
+
+// -------------------- Runtime State --------------------
 const startTime = Date.now();
-const users = new Set();             // user ids
-const groups = new Map();            // chatId -> { title, type }
 const adminCache = new Map();        // chatId -> boolean (bot is admin or not)
 const state = new Map();             // chatId -> { expr, result, msgId }
 
@@ -30,7 +60,8 @@ function safeEval(expr) {
     .replace(/−/g, "-")
     .replace(/,/g, "");
 
-  const blocked = /(import|createUnit|evaluate|parse|simplify|derivative|compile|help|unit|format|typed|reviver|json|chain|matrix|ones|zeros|range|index|subset|concat|resize)/i;
+  const blocked =
+    /(import|createUnit|evaluate|parse|simplify|derivative|compile|help|unit|format|typed|reviver|json|chain|matrix|ones|zeros|range|index|subset|concat|resize)/i;
   if (blocked.test(s)) throw new Error("Unsupported expression.");
 
   const allowed = /^[0-9+\-*/().\s^%piePIE]*$/;
@@ -88,20 +119,78 @@ function renderUI(expr, result) {
   return `🧮 BIKA Calculator\n\nExpr: ${e}\nResult: ${r}\n\nTip: Inline → @YourBot 12*(3+4)`;
 }
 
-// -------------------- Helper: Track users/groups --------------------
-function trackContext(ctx) {
-  try {
-    if (ctx.from && ctx.from.id) {
-      users.add(ctx.from.id);
+// -------------------- Helper: Uptime format --------------------
+function formatUptime(ms) {
+  let sec = Math.floor(ms / 1000);
+  const days = Math.floor(sec / 86400);
+  sec %= 86400;
+  const hours = Math.floor(sec / 3600);
+  sec %= 3600;
+  const mins = Math.floor(sec / 60);
+  sec %= 60;
+
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (mins) parts.push(`${mins}m`);
+  parts.push(`${sec}s`);
+  return parts.join(" ");
+}
+
+// -------------------- Helper: Track users/groups into DB --------------------
+async function trackContext(ctx) {
+  const ops = [];
+
+  if (ctx.from && ctx.from.id) {
+    const u = ctx.from;
+    ops.push(
+      User.findOneAndUpdate(
+        { userId: u.id },
+        {
+          $set: {
+            firstName: u.first_name || "",
+            lastName: u.last_name || "",
+            username: u.username || "",
+            languageCode: u.language_code || "",
+            isBot: u.is_bot || false,
+            lastSeenAt: new Date(),
+          },
+          $setOnInsert: {
+            isBlocked: false,
+          },
+        },
+        { upsert: true, new: true }
+      ).exec()
+    );
+  }
+
+  if (
+    ctx.chat &&
+    (ctx.chat.type === "group" || ctx.chat.type === "supergroup")
+  ) {
+    const c = ctx.chat;
+    ops.push(
+      Group.findOneAndUpdate(
+        { chatId: c.id },
+        {
+          $set: {
+            title: c.title || "",
+            type: c.type,
+            isActive: true,
+            lastSeenAt: new Date(),
+          },
+        },
+        { upsert: true, new: true }
+      ).exec()
+    );
+  }
+
+  if (ops.length) {
+    try {
+      await Promise.all(ops);
+    } catch (err) {
+      console.error("trackContext error:", err.message);
     }
-    if (ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup")) {
-      groups.set(ctx.chat.id, {
-        title: ctx.chat.title || "",
-        type: ctx.chat.type,
-      });
-    }
-  } catch (_) {
-    // ignore tracking errors
   }
 }
 
@@ -128,24 +217,43 @@ async function isBotAdminInChat(ctx) {
   }
 }
 
-// -------------------- Helper: Uptime format --------------------
-function formatUptime(ms) {
-  let sec = Math.floor(ms / 1000);
-  const days = Math.floor(sec / 86400); sec %= 86400;
-  const hours = Math.floor(sec / 3600); sec %= 3600;
-  const mins = Math.floor(sec / 60); sec %= 60;
+// -------------------- Handle my_chat_member (join/leave groups) --------------------
+bot.on("my_chat_member", async (ctx) => {
+  const chat = ctx.chat;
+  if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
 
-  const parts = [];
-  if (days) parts.push(`${days}d`);
-  if (hours) parts.push(`${hours}h`);
-  if (mins) parts.push(`${mins}m`);
-  parts.push(`${sec}s`);
-  return parts.join(" ");
-}
+  const status = ctx.myChatMember?.new_chat_member?.status;
+  if (!status) return;
+
+  try {
+    if (status === "left" || status === "kicked") {
+      await Group.findOneAndUpdate(
+        { chatId: chat.id },
+        { $set: { isActive: false, lastSeenAt: new Date() } }
+      ).exec();
+      adminCache.delete(chat.id);
+    } else if (status === "member" || status === "administrator") {
+      await Group.findOneAndUpdate(
+        { chatId: chat.id },
+        {
+          $set: {
+            title: chat.title || "",
+            type: chat.type,
+            isActive: true,
+            lastSeenAt: new Date(),
+          },
+        },
+        { upsert: true }
+      ).exec();
+    }
+  } catch (err) {
+    console.error("my_chat_member handler error:", err.message);
+  }
+});
 
 // -------------------- Commands --------------------
 bot.start(async (ctx) => {
-  trackContext(ctx);
+  await trackContext(ctx);
 
   const chatId = ctx.chat.id;
   const s = { expr: "", result: "", msgId: null };
@@ -156,7 +264,7 @@ bot.start(async (ctx) => {
 });
 
 bot.command("calc", async (ctx) => {
-  trackContext(ctx);
+  await trackContext(ctx);
   const input = ctx.message.text.replace("/calc", "").trim();
   if (!input) return ctx.reply("Usage: /calc 12*(3+4)");
 
@@ -170,40 +278,46 @@ bot.command("calc", async (ctx) => {
 
 // Owner-only admin dashboard
 bot.command("admin", async (ctx) => {
-  trackContext(ctx);
+  await trackContext(ctx);
   if (!OWNER_ID || ctx.from.id !== OWNER_ID) {
     return ctx.reply("❌ Owner only command.");
   }
 
-  const totalUsers = users.size;
-  const totalGroups = groups.size;
+  const [totalUsers, totalGroups, activeGroups] = await Promise.all([
+    User.countDocuments({}).exec(),
+    Group.countDocuments({}).exec(),
+    Group.find({ isActive: true })
+      .sort({ updatedAt: -1 })
+      .limit(30)
+      .lean()
+      .exec(),
+  ]);
+
   const uptimeMs = Date.now() - startTime;
   const uptimeStr = formatUptime(uptimeMs);
 
   let groupList = "";
-  let index = 1;
-  for (const [chatId, info] of groups.entries()) {
-    if (index > 30) {
-      groupList += `\n… and more (${totalGroups} groups total)`;
-      break;
-    }
-    groupList += `\n${index}. ${info.title || "(no title)"} [${chatId}]`;
-    index++;
+  activeGroups.forEach((g, idx) => {
+    groupList += `\n${idx + 1}. ${g.title || "(no title)"} [${g.chatId}]`;
+  });
+  if (totalGroups > activeGroups.length) {
+    groupList += `\n… and more (${totalGroups} groups total)`;
   }
 
   const text =
     `🔐 BIKA Calculator — Admin Dashboard\n\n` +
     `👤 Bot Users: ${totalUsers}\n` +
-    `👥 Total Groups: ${totalGroups}\n` +
+    `👥 Total Groups (all-time): ${totalGroups}\n` +
+    `👥 Active Groups: ${activeGroups.length}\n` +
     `⏱ Uptime: ${uptimeStr}\n` +
-    `${totalGroups ? "\n📜 Group List:" + groupList : ""}`;
+    (activeGroups.length ? `\n📜 Active Group List:${groupList}` : "");
 
   return ctx.reply(text);
 });
 
 // Owner-only broadcast
 bot.command("broadcast", async (ctx) => {
-  trackContext(ctx);
+  await trackContext(ctx);
   if (!OWNER_ID || ctx.from.id !== OWNER_ID) {
     return ctx.reply("❌ Owner only command.");
   }
@@ -214,23 +328,30 @@ bot.command("broadcast", async (ctx) => {
   }
 
   const msg = `📢 [BIKA Calculator Broadcast]\n\n${args}`;
-  let userOk = 0, userFail = 0;
-  let groupOk = 0, groupFail = 0;
 
-  // send to users
-  for (const userId of users) {
+  // Get all users and active groups from DB
+  const [userDocs, groupDocs] = await Promise.all([
+    User.find({ isBlocked: { $ne: true } }).select("userId").lean().exec(),
+    Group.find({ isActive: true }).select("chatId").lean().exec(),
+  ]);
+
+  let userOk = 0,
+    userFail = 0;
+  let groupOk = 0,
+    groupFail = 0;
+
+  for (const u of userDocs) {
     try {
-      await ctx.telegram.sendMessage(userId, msg);
+      await ctx.telegram.sendMessage(u.userId, msg);
       userOk++;
     } catch (_) {
       userFail++;
     }
   }
 
-  // send to groups
-  for (const [chatId] of groups.entries()) {
+  for (const g of groupDocs) {
     try {
-      await ctx.telegram.sendMessage(chatId, msg);
+      await ctx.telegram.sendMessage(g.chatId, msg);
       groupOk++;
     } catch (_) {
       groupFail++;
@@ -239,14 +360,14 @@ bot.command("broadcast", async (ctx) => {
 
   return ctx.reply(
     `✅ Broadcast finished.\n\n` +
-    `👤 Users: ${userOk} sent, ${userFail} failed.\n` +
-    `👥 Groups: ${groupOk} sent, ${groupFail} failed.`
+      `👤 Users: ${userOk} sent, ${userFail} failed.\n` +
+      `👥 Groups: ${groupOk} sent, ${groupFail} failed.`
   );
 });
 
-// -------------------- Plain text calculator --------------------
+// -------------------- Text (Group auto-calc + Private calc) --------------------
 bot.on("text", async (ctx) => {
-  trackContext(ctx);
+  await trackContext(ctx);
 
   const text = ctx.message.text.trim();
   if (text.startsWith("/")) return; // commands handled separately
@@ -258,7 +379,6 @@ bot.on("text", async (ctx) => {
 
     try {
       const result = safeEval(text);
-      // pretty: replace * with ×, / with ÷ in expression only
       const prettyExpr = text.replace(/\*/g, "×").replace(/\//g, "÷");
       return ctx.reply(`${prettyExpr} = ${result}`);
     } catch (_) {
@@ -280,7 +400,7 @@ bot.on("text", async (ctx) => {
 
 // -------------------- Button UI actions --------------------
 bot.on("callback_query", async (ctx) => {
-  trackContext(ctx);
+  await trackContext(ctx);
 
   const chatId = ctx.chat.id;
   const data = ctx.callbackQuery.data || "";
@@ -327,11 +447,9 @@ bot.on("callback_query", async (ctx) => {
 });
 
 // -------------------- ✅ Inline Mode --------------------
-// Enable in BotFather: /setinline -> choose your bot -> Turn ON
 bot.on("inline_query", async (ctx) => {
   const q = (ctx.inlineQuery.query || "").trim();
 
-  // If empty query, show hint
   if (!q) {
     return ctx.answerInlineQuery(
       [
@@ -374,18 +492,21 @@ bot.on("inline_query", async (ctx) => {
 // -------------------- ✅ Webhook Server (Render) --------------------
 const app = express();
 
-// health check + uptime ping target
 app.get("/", (req, res) => res.status(200).send("OK - BIKA Calculator Bot"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 app.use(express.json());
-
-// Telegraf webhook middleware
 app.use("/telegraf", bot.webhookCallback("/telegraf"));
 
 async function start() {
   try {
-    // Make sure botInfo is available (for getChatMember)
+    // MongoDB connect
+    await mongoose.connect(MONGODB_URI, {
+      maxPoolSize: 10,
+    });
+    console.log("✅ MongoDB connected");
+
+    // bot info (for admin check)
     const me = await bot.telegram.getMe();
     bot.botInfo = me;
     console.log(`🤖 Logged in as @${me.username}`);
@@ -406,6 +527,5 @@ async function start() {
 
 start();
 
-// graceful stop
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
